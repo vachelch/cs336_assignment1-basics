@@ -7,8 +7,8 @@ from cs336_basics.utils import log_time
 
 def find_chunk_boundaries(
     file: BinaryIO,
-    desired_chunk_size: int,
     split_special_token: bytes,
+    desired_chunk_size: int = 10*1024*1024
 ) -> list[int]:
     """
     Chunk the file into parts that can be counted independently.
@@ -69,13 +69,12 @@ def pre_tokenization(
         input_path: str, 
         special_tokens: list[str],
         num_pros: int | None = None,
-        chunk_size: int = 10*1024*1024
 ) -> Counter[str]:
     with open(input_path, 'rb') as f:
         split_special_token = '\n'
         if len(special_tokens) > 0:
             split_special_token = special_tokens[0]
-        bounds = find_chunk_boundaries(f, chunk_size, split_special_token.encode('utf-8'))
+        bounds = find_chunk_boundaries(f, split_special_token.encode('utf-8'))
     
     tasks = [(input_path, l, r, special_tokens) for l, r in zip(bounds[:-1], bounds[1:])]
     num_pros = min(num_pros or os.cpu_count(), len(tasks))
