@@ -128,9 +128,12 @@ class ROPE(nn.Module):
         return res
 
 def softmax(x: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+    in_type = x.dtype
+    x = x.to(torch.float32)
     x_max = x.max(dim = dim, keepdim = True).values
     x_exp = (x - x_max).exp()
-    return x_exp / x_exp.sum(dim = dim, keepdim = True)
+    res = x_exp / x_exp.sum(dim = dim, keepdim = True)
+    return res.to(in_type)
 
 def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
@@ -166,7 +169,8 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(
         self, 
         x: Float[Tensor, " ... seq_len d_model"],
-        token_positions: Int[Tensor, " ... seq_len"] | None = None
+        token_positions: Int[Tensor, " ... seq_len"] | None = None,
+        mask: Bool[Tensor, " ... queries keys"] | None = None
     ) -> Float[Tensor, " ... seq_len d_model"]:
         seq_len = x.shape[-2]
         q = rearrange(self.q_proj(x), "... seq_len (num_heads h) -> ... num_heads seq_len h", num_heads = self.num_heads)
@@ -179,9 +183,9 @@ class MultiHeadSelfAttention(nn.Module):
             token_positions = rearrange(token_positions, "... seq_len -> ... 1 seq_len")
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
-
-        mask = torch.tril(
-            torch.ones(seq_len, seq_len, device = x.device, dtype = torch.bool))
+        if mask is None:
+            mask = torch.tril(
+                torch.ones(seq_len, seq_len, device = x.device, dtype = torch.bool))
         out = scaled_dot_product_attention(q, k, v, mask)
         out = rearrange(out, "... num_heads seq_len h_size -> ... seq_len (num_heads h_size)")
         return self.output_proj(out)
@@ -203,13 +207,19 @@ class TransformerBlock(nn.Module):
         self.ln1 = RMSNorm(d_model, device = device, dtype = dtype)
         self.ln2 = RMSNorm(d_model, device = device, dtype = dtype)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
     def forward(
         self, 
         x: Float[Tensor, " ... seq_len d_model"], 
-        token_positions: Int[Tensor, " ... seq_len"] | None = None
+        token_positions: Int[Tensor, " ... seq_len"] | None = None,
+        mask: Bool[Tensor, " ... queries keys"] | None = None
     ) -> Float[Tensor, " ... seq_len d_model"]:
-        x_att = x + self.attn(self.ln1(x), token_positions)
-        x_out = x_att + self.ffn(self.ln2(x_att))
+        # keep residual stream in fp32, x is fp32, branches run in param dtype
+        x_att = x + self.attn(self.ln1(x.to(self.dtype)), token_positions, mask)
+        x_out = x_att + self.ffn(self.ln2(x_att.to(self.dtype)))
         return x_out
 
 class TransformerLM(nn.Module):
@@ -223,10 +233,12 @@ class TransformerLM(nn.Module):
         d_ff: int, 
         rope_theta: float = 10000.0, 
         device: torch.device | None = None, 
-        dtype: torch.dtype | None = None
+        dtype: torch.dtype | None = None,
+        eos_id: int | None = None
     ):
         super().__init__()
 
+        self.eos_id = eos_id
         self.context_length = context_length
         self.token_embeddings = Embedding(vocab_size, d_model, device, dtype)
         rope = ROPE(rope_theta, d_model // num_heads, context_length, device)
@@ -238,19 +250,55 @@ class TransformerLM(nn.Module):
 
     def forward(
         self, 
-        x: Int[Tensor, " ... seq_len"], 
-        token_positions: Int[Tensor, " ... seq_len"] | None = None
+        x: Int[Tensor, " ... seq_len"]
     ) -> Float[Tensor, " ... seq_len vocab_size"]:
         seq_len = x.shape[-1]
         assert seq_len <= self.context_length
-        if token_positions is None:
-            token_positions = torch.arange(seq_len, device=x.device)
 
+        # document aware attention
+        mask = torch.tril(
+            torch.ones(seq_len, seq_len, device = x.device, dtype = torch.bool)
+        )
+        token_positions = torch.arange(seq_len, device = x.device)
+        if self.eos_id is not None:
+            doc_ids, token_positions = get_doc_ids_and_positions(x, self.eos_id)
+            same_doc = doc_ids[..., :, None] == doc_ids[..., None, :]
+            mask = (mask & same_doc)[..., None, :, :]
+
+        # keep residual stream in fp32
         x = self.token_embeddings(x)
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
         for layer in self.layers:
-            x = layer(x, token_positions)
-        x = self.lm_head(self.ln_final(x))
+            x = layer(x, token_positions, mask)
+        x = self.lm_head(self.ln_final(x.to(in_dtype)))
         return x
+
+def get_doc_ids_and_positions(
+    x: Int[Tensor, " ... seq_len"], eos_id
+) -> tuple[Int[Tensor, " ... seq_len"], Int[Tensor, " ... seq_len"]]:
+    # EOS belongs to the doc it ends
+    is_eos = (x == eos_id).long()
+    doc_ids = is_eos.cumsum(dim = -1) - is_eos
+
+    # restart positions at 0 for each doc: position = index - doc start index
+    index = torch.arange(x.shape[-1], device = x.device).expand_as(x)
+    is_start = torch.ones_like(x, dtype = torch.bool)
+    is_start[..., 1:] = is_eos[..., :-1]
+    start_index = torch.where(is_start, index, 0)
+    return doc_ids, index - torch.cummax(start_index, dim = -1).values
+
+
+    # is_eos = (x == eos_id).long()
+    # doc_ids = torch.cumsum(is_eos, dim = -1) - is_eos
+
+    # # restart positions at 0 for each doc: position = index - doc start index
+    # idx = torch.arange(x.shape[-1], device = x.device).expand_as(x)
+    # is_start = torch.ones_like(x, dtype = torch.bool)
+    # is_start[..., 1:] = doc_ids[..., 1:] != doc_ids[..., :-1]
+    # start = torch.where(is_start, idx, 0).cummax(dim = -1).values
+    # return doc_ids, idx - start
+
 
 
 def print_stats(

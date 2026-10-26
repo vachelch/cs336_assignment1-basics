@@ -13,6 +13,8 @@ def cross_entropy(
         logits: Float[Tensor, " ... seq_len vocab_size"], 
         targets: Int[Tensor, " ... seq_len"]
     ) -> Float[Tensor, ""]:
+    logits = logits.to(torch.float32)
+
     shifted = logits - logits.max(dim = -1, keepdim = True).values
     targets = rearrange(targets, "... -> ... 1")
     target_shifted = shifted.gather(-1, targets).squeeze(-1)
@@ -51,10 +53,14 @@ class AdamW(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad.data
+                # compute in fp32 even if params / grads are bf16
+                g = p.grad.data.to(torch.float32)
 
-                # get state
+                # get state, m / v / master weights are kept in fp32
                 state = self.state[p]
+                if p.dtype != torch.float32 and "master" not in state:
+                    state["master"] = p.data.to(torch.float32)
+                master = state.get("master", p.data)
                 m = state.get("m", torch.zeros_like(g))
                 v = state.get("v", torch.zeros_like(g))
                 t = state.get("t", 1)
@@ -65,14 +71,25 @@ class AdamW(torch.optim.Optimizer):
                 a = 1 / (1 - beta1 ** t)
                 b = 1 / (1 - beta2 ** t)
                 adjust = a / math.sqrt(b)
-                p.data -= lr * weight_decay * p.data
-                p.data -= lr * adjust * m / (torch.sqrt(v) + eps)
+                master -= lr * weight_decay * master
+                master -= lr * adjust * m / (torch.sqrt(v) + eps)
+                if "master" in state:
+                    p.data.copy_(master)
 
                 # update state
                 state["m"] = m
                 state["v"] = v
                 state["t"] = t + 1
         return loss
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        params = [p for group in self.param_groups for p in group['params']]
+        for _id, state in state_dict["state"].items():
+            p = params[_id]
+            for key in ("m", "v", "master"):
+                if key in state:
+                    self.state[p][key] = state[key].to(device = p.device)
 
 def get_lr_cosine_schedule(
     t: int,
@@ -96,7 +113,7 @@ def gradient_clipping(
     grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
         return
-    total_norm = torch.stack([(g.data ** 2).sum() for g in grads]).sum()
+    total_norm = torch.stack([(g.data.to(torch.float32) ** 2).sum() for g in grads]).sum()
     total_norm = torch.sqrt(total_norm).item()
     if total_norm <= max_l2_norm: 
         return
@@ -117,7 +134,7 @@ def learning_rate_tuning(lr: float):
         opt.step()
 
 def adam_accounting(
-        bs: int = 3, V: int = 50257, T: int = 1024, L: int = 48, d: int = 1600, h: int = 25
+        bs: int = 1, V: int = 50257, T: int = 1024, L: int = 48, d: int = 1600, h: int = 25
     ):
     # peak memory, counting using float32
     ## parameters
@@ -133,7 +150,7 @@ def adam_accounting(
     num_params = 2 * V * d + L * (12 * d**2 + 2 * d) + d
 
     ## parameters = P, gradients = P, optimizer_state = 2*P
-    ## activatinons
+    ## activations
     """
     A = L * (56/3 BTd + 2BhT^2) + BTd + 2BTV
         * 2 RMSNorm: 2BTd
@@ -143,12 +160,14 @@ def adam_accounting(
         * attn @ V: BTd
         * out proj: BTd
         * swiglu: BT*d_ff * 4 + BTd = 35/3*BTd
-        * final RMSNorm, logits, log-softamx: BTd + 2BTV
+        * final RMSNorm, logits, log-softmax: BTd + 2BTV
     """
     num_activations = L * (56/3 * bs * T * d + 2 * bs * h * T ** 2) + bs * T * d + 2 * bs * T * V
+    print(f"num_params: {num_params / 1e9 :.3f}B")
     print(f"peak memory in float32: {4 * (num_params * 4 + num_activations) / 1e9 :.2f}GB")
-    print(f"  - params, gradients, optimizer_states takes: {4*4*num_params / 1e9 :.2f}GB")
-    print(f"  - activations takes: {4*num_activations / 1e9 :.2f}GB, with batch_size = {bs}")
+    print(f"  - params, gradients, optimizer_states: {4*4*num_params / 1e9 :.2f}GB")
+    print(f"  - activations: {4*num_activations / 1e9 :.2f}GB, with batch_size = {bs}")
+    print(f"  - activations, 1 batch_size: {4*num_activations / bs / 1e9 :.2f}GB")
 
     # FLOPS
     """
@@ -162,14 +181,34 @@ def adam_accounting(
     * backward = 2 * forward
     * optimizer = 13 * num_params
     """
-    flops = 3 * (L * (24 * T * d**2 + 4 * T**2 * d) + 2 * T * d * V)
-    print(f"Take {flops / 1e12 :.2f}TFLOPs for one step of AdamW (batch_size = 1)")
+    FLOPs_step = 3 * bs * (L * (24 * T * d**2 + 4 * T**2 * d) + 2 * T * d * V)
+    print(f"FLOPS/step: {FLOPs_step / 1e12 :.2f}TFLOPs for one step of AdamW (batch_size = {bs})")
 
-    # time counting for peak 495 TFLOP/s, 50% MFU, batch_size = 1024, 400k step
-    seconds = 4e5 * flops * 1024 / (495e12 * 0.5)
-    print(f"{seconds :.0f} seconds, {seconds / 24 / 3600 :.1f} days to train GPT-2 XL, "
-          "for 400k step and batch size = 1024, "
-          "on a single H100 (495 TFLOP/s for float32, MFU 50%)")
+    # # time counting for peak 495 TFLOP/s, 50% MFU, batch_size = 1024, 400k step
+    # seconds = 4e5 * flops_step / bs * 1024 / (495e12 * 0.5)
+    # print(f"{seconds :.0f} seconds, {seconds / 24 / 3600 :.1f} days to train GPT-2 XL, "
+    #       "for 400k step and batch size = 1024, "
+    #       "on a single H100 (495 TFLOP/s for float32, MFU 50%)")
+
+    # num_params, token_per_param = 20, require tokens = token_per_param * num_params 
+    # takes steps = total_tokens / batch_size / context_length
+    token_per_param = 20
+    total_tokens = token_per_param * num_params
+    total_steps = int(total_tokens / bs / T)
+    
+    mfu = 0.4
+    peak_FLOPS = 14e12
+    total_FLOPs = FLOPs_step * total_steps
+    estimated_seconds = total_FLOPs / (peak_FLOPS * mfu)
+    print(f"Require: {total_tokens / 1e9 :.2f}B total tokens, ~= {total_steps} steps\n",
+          f"  - num_params = {num_params / 1e9 :.3f}B\n"
+          f"  - token_per_param = {token_per_param}\n",
+          f"  - with: bs = {bs}, seq_len = {T}\n",
+          f"Estimated {estimated_seconds :.1f}s to finish\n",
+          f"  - Assume setting: peak_FLOPS: {peak_FLOPS/1e12 :.1f}TFLOPs/s, MFU = {mfu}\n",
+          f"  - Total FLOPs: {total_FLOPs / 1e12 :.1f}TFLOPs",
+    )
+    return FLOPs_step
 
 
 if __name__ == "__main__":
@@ -178,5 +217,5 @@ if __name__ == "__main__":
     # when |1 - 0.02 * lr| > 1, loss_ get bigger and bigger
     # learning_rate_tuning(1000)
 
-    adam_accounting()
+    adam_accounting(bs = 1)
 
