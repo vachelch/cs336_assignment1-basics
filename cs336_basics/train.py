@@ -1,4 +1,4 @@
-import os, time
+import os, time, math
 import typing
 import torch
 from torch import Tensor
@@ -9,6 +9,35 @@ from cs336_basics.modules import TransformerLM
 from cs336_basics.optimizer import AdamW, cross_entropy, get_lr_cosine_schedule, gradient_clipping
 from cs336_basics.util_device_bench import device_bench
 from cs336_basics.optimizer import adam_accounting
+from dataclasses import dataclass, asdict
+import argparse
+
+def parse_train_args():
+    p = argparse.ArgumentParser(description="Train a Transformer LM")
+    # data
+    p.add_argument("--train_path", type=str, default = "data/tokenized/TinyStoriesV2_train_ids.bin")
+    p.add_argument("--eval_path", type=str, default = "data/tokenized/TinyStoriesV2_valid_ids.bin")
+    p.add_argument("--batch_size", type=int, default = 32)
+
+    # model
+    # optimizer
+
+    # args
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--ckpt_path", type=str, default = "data/checkpoints/ckpt_step_40.pt")
+    p.add_argument("--ckpt_dir", type=str, default = "data/checkpoints/")
+    p.add_argument("--log_interval", type=int, default = 10)
+    p.add_argument("--save_ckpt_interval", type=int, default = 20)
+    p.add_argument("--eval_iters", type=int, default = 10)
+    p.add_argument("--eval_interval", type=int, default = 20)
+    p.add_argument("--enable_wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default = "cs336")
+    p.add_argument("--wandb_run_name", type=str, default = "tiny_stories_test1")
+
+    args, _ = p.parse_known_args()
+    return args
+
+args = parse_train_args()
 
 def get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
@@ -46,10 +75,23 @@ def load_checkpoint(
     optimizer.load_state_dict(ckpt["optimizer"])
     return ckpt["iteration"]
 
+@torch.no_grad()
+def evaluate(model, eval_data, cfg):
+    total_loss = []
+    for _ in range(cfg.args.eval_iters):
+        inputs, targets = get_batch(eval_data, cfg.data.batch_size, cfg.model.context_length, cfg.model.device)
+        logits = model(inputs)
+        loss = cross_entropy(logits, targets)
+        total_loss.append(loss)
+    return (sum(total_loss) / len(total_loss)).item()
+
+
 def split_decay_parameters(name_params):
     no_decay = []
     decay = []
     for name, p in name_params:
+        if not p.requires_grad:
+            continue
         if any(n in name for n in ("token_embeddings", "ln_final", "ln1", "ln2")):
             no_decay.append(p)
         else:
@@ -63,6 +105,7 @@ def default_device() -> str:
         return "mps"
     return "cpu"
 
+@dataclass
 class ModelConfig:
     vocab_size: int = 10000
     context_length: int = 256
@@ -75,40 +118,61 @@ class ModelConfig:
     dtype: torch.dtype = torch.float16
     eos_id: int | None = 0  # <|endoftext|> is id 0 in the TinyStories vocab
 
+@dataclass
 class OptimConfig:
-    lr: float = 1e-3
     betas: tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 0.01
     lr_max: float = 3e-4
     lr_min: float = 3e-5
     max_l2_norm: float = 1.0
 
+@dataclass
 class DataConfig:
-    train_path: str = "data/tokenized/TinyStoriesV2_train_ids.bin"
-    eval_path: str = "data/tokenized/TinyStoriesV2_valid_ids.bin"
+    train_path: str = args.train_path
+    eval_path: str = args.eval_path
     data_type: str = "uint16"
-    batch_size: int = 32
+    batch_size: int = args.batch_size
     # 32 * 256 * 40000 ~= 327M tokens
     max_iter: int = 40000
+    warmup_iter: int = 40000 // 10
 
+@dataclass
 class ArgsConfig:
-    resume: bool = False
-    ckpt_path: str = "checkpoints/tinystories.pt"
-    log_interval: int = 5
+    resume: bool = args.resume
+    ckpt_path: str = args.ckpt_path
+    ckpt_dir: str = args.ckpt_dir
+    log_interval: int = args.log_interval
+    save_ckpt_interval: int = args.save_ckpt_interval
+    eval_iters: int = args.eval_iters
+    eval_interval: int = args.eval_interval
+    enable_wandb: bool = args.enable_wandb
+    wandb_project: str = args.wandb_project
+    wandb_run_name: str = args.wandb_run_name
 
 class Config:
-    model: ModelConfig = ModelConfig()
-    optim: OptimConfig = OptimConfig()
-    data: DataConfig = DataConfig()
-    args: ArgsConfig = ArgsConfig()
+    def __init__(self):
+        self.model: ModelConfig = ModelConfig()
+        self.optim: OptimConfig = OptimConfig()
+        self.data: DataConfig = DataConfig()
+        self.args: ArgsConfig = ArgsConfig()
 
 def train():
     cfg = Config()
+    os.makedirs(cfg.args.ckpt_dir, exist_ok = True)
+    if cfg.args.enable_wandb:
+        import wandb
+        config = {k: asdict(v) for k, v in vars(cfg).items()}
+        config["model"]["dtype"] = str(cfg.model.dtype)  # torch.dtype is not JSON-serializable
+        wandb.init(
+            project = cfg.args.wandb_project,
+            name = cfg.args.wandb_run_name,
+            config = config,
+        )
 
     # device benchmark
     bench_dict = device_bench()
 
-    # current setting devcie peak flops/s
+    # current setting device peak flops/s
     peak_FLOPS = bench_dict[(cfg.model.device, str(cfg.model.dtype))]
     print(f"current setting, device: {cfg.model.device}, dtype: {str(cfg.model.dtype)}, peak_FLOPS: {peak_FLOPS/1e12 :.2f}TFLOP/s")
 
@@ -140,12 +204,12 @@ def train():
     param_groups = split_decay_parameters(model.named_parameters())
     optimizer = AdamW(
         param_groups,
-        cfg.optim.lr, 
+        cfg.optim.lr_min, 
         cfg.optim.betas, 
         cfg.optim.weight_decay,
     )
     start_iter = 0
-    if cfg.args.resume and os.path.exists(cfg.args.ckpt_path):
+    if cfg.args.resume:
         start_iter = load_checkpoint(cfg.args.ckpt_path, model, optimizer)
         print(f"Resume from {cfg.args.ckpt_path} at iteration {start_iter}")
 
@@ -154,7 +218,7 @@ def train():
     for it in range(start_iter, cfg.data.max_iter):
         inputs, targets = get_batch(train_data, cfg.data.batch_size, cfg.model.context_length, cfg.model.device)
         lr = get_lr_cosine_schedule(
-            it, cfg.optim.lr_max, cfg.optim.lr_min, cfg.data.max_iter // 10, cfg.data.max_iter
+            it, cfg.optim.lr_max, cfg.optim.lr_min, cfg.data.warmup_iter, cfg.data.max_iter
         )
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -171,18 +235,39 @@ def train():
             t0 = time.time()
             steps = cfg.args.log_interval if it != start_iter else 1
 
-            print(FLOPs_step, steps, dt, peak_FLOPS)
             real_FLOPS = FLOPs_step * steps / dt
             real_MFU = round(real_FLOPS / peak_FLOPS, 4)
 
             print({
-                "train/loss": loss.item(),
-                "lr": lr,
+                "step": it,
+                "train/loss": round(loss.item(), 4),
+                "lr": float(f"{lr:.3g}"),
                 "real_MFU": real_MFU,
                 "step_per_sec": round(steps / max(dt, 1e-9), 2),
                 "tokens_per_sec": int(tokens_per_step * steps / max(dt, 1e-9)),
                 "tokens_seen": (it + 1) * tokens_per_step,
-            }, it)
+            })
+
+            if cfg.args.enable_wandb:
+                wandb.log({"train/loss": loss.item(), "lr": lr}, step=it)
+
+        if it > 0 and it % cfg.args.eval_interval == 0:
+            val_loss = evaluate(model, eval_data, cfg)
+            print(f"  >> eval_loss {val_loss:.4f} | eval_ppl {math.exp(val_loss):.2f}")
+            if cfg.args.enable_wandb:
+                wandb.log({"eval/loss": val_loss, "eval/ppl": math.exp(val_loss)}, step=it)
+
+        if (it+1) % cfg.args.save_ckpt_interval == 0:
+            ckpt_path = os.path.join(cfg.args.ckpt_dir, f"ckpt_step_{it+1}.pt")
+            save_checkpoint(model, optimizer, it+1, ckpt_path)
+            print(f"Saved ckpt to {ckpt_path}")
+
+    ckpt_path = os.path.join(cfg.args.ckpt_dir, f"ckpt_step_{cfg.data.max_iter}.pt")
+    save_checkpoint(model, optimizer, cfg.data.max_iter, ckpt_path)
+    print(f"Saved ckpt to {ckpt_path}")
+
+
+
 
 
 if __name__ == "__main__":
