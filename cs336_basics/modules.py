@@ -4,6 +4,7 @@ from torch import Tensor
 import torch.nn as nn
 from jaxtyping import Bool, Float, Int
 from einops import einsum, rearrange
+import torch.nn.functional as F
 
 
 class Linear(nn.Module):
@@ -186,7 +187,10 @@ class MultiHeadSelfAttention(nn.Module):
         if mask is None:
             mask = torch.tril(
                 torch.ones(seq_len, seq_len, device = x.device, dtype = torch.bool))
-        out = scaled_dot_product_attention(q, k, v, mask)
+        if True:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask = mask)
+        else:
+            out = scaled_dot_product_attention(q, k, v, mask)
         out = rearrange(out, "... num_heads seq_len h_size -> ... seq_len (num_heads h_size)")
         return self.output_proj(out)
 

@@ -10,6 +10,7 @@ from cs336_basics.optimizer import AdamW, cross_entropy, get_lr_cosine_schedule,
 from cs336_basics.util_device_bench import device_bench
 from cs336_basics.optimizer import adam_accounting
 from dataclasses import dataclass, asdict
+import torch.nn.functional as F
 import argparse
 
 def parse_train_args():
@@ -27,9 +28,9 @@ def parse_train_args():
     p.add_argument("--ckpt_path", type=str, default = "data/checkpoints/ckpt_step_40.pt")
     p.add_argument("--ckpt_dir", type=str, default = "data/checkpoints/")
     p.add_argument("--log_interval", type=int, default = 10)
-    p.add_argument("--save_ckpt_interval", type=int, default = 20)
-    p.add_argument("--eval_iters", type=int, default = 10)
-    p.add_argument("--eval_interval", type=int, default = 20)
+    p.add_argument("--save_ckpt_interval", type=int, default = 100)
+    p.add_argument("--eval_iters", type=int, default = 20)
+    p.add_argument("--eval_interval", type=int, default = 100)
     p.add_argument("--enable_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default = "cs336")
     p.add_argument("--wandb_run_name", type=str, default = "tiny_stories_test1")
@@ -111,7 +112,7 @@ class ModelConfig:
     context_length: int = 256
     num_layers: int = 4
     d_model: int = 512
-    num_heads: int = 16
+    num_heads: int = 4
     d_ff: int = 1344
     rope_theta: float = 10000.0
     device: str = default_device()
@@ -201,13 +202,16 @@ def train():
         cfg.model.dtype,
         cfg.model.eos_id,
     )
+    compiled_model = torch.compile(model)
+
     param_groups = split_decay_parameters(model.named_parameters())
     optimizer = AdamW(
         param_groups,
-        cfg.optim.lr_min, 
-        cfg.optim.betas, 
+        cfg.optim.lr_min,
+        cfg.optim.betas,
         cfg.optim.weight_decay,
     )
+
     start_iter = 0
     if cfg.args.resume:
         start_iter = load_checkpoint(cfg.args.ckpt_path, model, optimizer)
@@ -222,8 +226,14 @@ def train():
         )
         for group in optimizer.param_groups:
             group["lr"] = lr
-        logits = model(inputs)
-        loss = cross_entropy(logits, targets)
+        logits = compiled_model(inputs)
+        if True:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.shape[-1]),
+                targets.view(-1)
+            )
+        else:
+            loss = cross_entropy(logits, targets)
         
         optimizer.zero_grad()
         loss.backward()
