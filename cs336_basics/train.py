@@ -28,12 +28,12 @@ def parse_train_args():
     p.add_argument("--ckpt_path", type=str, default = "data/checkpoints/ckpt_step_40.pt")
     p.add_argument("--ckpt_dir", type=str, default = "data/checkpoints/")
     p.add_argument("--log_interval", type=int, default = 100)
-    p.add_argument("--save_ckpt_interval", type=int, default = 1000)
+    p.add_argument("--save_ckpt_interval", type=int, default = 10000)
     p.add_argument("--eval_iters", type=int, default = 40)
-    p.add_argument("--eval_interval", type=int, default = 500)
+    p.add_argument("--eval_interval", type=int, default = 1000)
     p.add_argument("--enable_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default = "cs336")
-    p.add_argument("--wandb_run_name", type=str, default = "tiny_stories_test1")
+    p.add_argument("--wandb_run_name", type=str, default = "tiny_stories_v2")
 
     args, _ = p.parse_known_args()
     return args
@@ -112,7 +112,7 @@ class ModelConfig:
     context_length: int = 256
     num_layers: int = 4
     d_model: int = 512
-    num_heads: int = 4
+    num_heads: int = 8
     d_ff: int = 1344
     rope_theta: float = 10000.0
     device: str = default_device()
@@ -121,10 +121,10 @@ class ModelConfig:
 
 @dataclass
 class OptimConfig:
-    betas: tuple[float, float] = (0.9, 0.999)
-    weight_decay: float = 0.01
-    lr_max: float = 3e-4
-    lr_min: float = 3e-5
+    betas: tuple[float, float] = (0.9, 0.95)
+    weight_decay: float = 0.1
+    lr_max: float = 3e-3
+    lr_min: float = 3e-4
     max_l2_norm: float = 1.0
 
 @dataclass
@@ -134,8 +134,8 @@ class DataConfig:
     data_type: str = "uint16"
     batch_size: int = args.batch_size
     # 32 * 256 * 40000 ~= 327M tokens
-    max_iter: int = 40000
-    warmup_iter: int = 40000 // 10
+    max_iter: int = 50000
+    warmup_iter: int = 50000 // 20
 
 @dataclass
 class ArgsConfig:
@@ -202,15 +202,27 @@ def train():
         cfg.model.dtype,
         cfg.model.eos_id,
     )
-    compiled_model = torch.compile(model)
+
+    # compile forward + loss together so the fp32 upcast and CE get fused with the lm_head
+    def loss_fn(inputs, targets):
+        logits = model(inputs)
+        if True:
+            return F.cross_entropy(
+                logits.float().view(-1, logits.shape[-1]),
+                targets.view(-1)
+            )
+        else:
+            return cross_entropy(logits, targets)
+    compiled_loss_fn = torch.compile(loss_fn)
 
     param_groups = split_decay_parameters(model.named_parameters())
-    if True:
+    if False:
         optimizer = torch.optim.AdamW(
             param_groups,
             lr = cfg.optim.lr_min,
             betas = cfg.optim.betas,
             weight_decay = cfg.optim.weight_decay,
+            fused=True
         )
     else:
         optimizer = AdamW(
@@ -234,15 +246,8 @@ def train():
         )
         for group in optimizer.param_groups:
             group["lr"] = lr
-        logits = compiled_model(inputs)
-        if True:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.shape[-1]),
-                targets.view(-1)
-            )
-        else:
-            loss = cross_entropy(logits, targets)
-        
+        loss = compiled_loss_fn(inputs, targets)
+
         optimizer.zero_grad()
         loss.backward()
         gradient_clipping(model.parameters(), cfg.optim.max_l2_norm)
@@ -259,7 +264,7 @@ def train():
             print({
                 "step": it,
                 "train/loss": round(loss.item(), 4),
-                "lr": float(f"{lr:.3g}"),
+                "lr": float(f"{lr:.4e}"),
                 "real_MFU": real_MFU,
                 "step_per_sec": round(steps / max(dt, 1e-9), 2),
                 "tokens_per_sec": int(tokens_per_step * steps / max(dt, 1e-9)),
