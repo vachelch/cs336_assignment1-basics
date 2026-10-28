@@ -27,10 +27,10 @@ def parse_train_args():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--ckpt_path", type=str, default = "data/checkpoints/ckpt_step_40.pt")
     p.add_argument("--ckpt_dir", type=str, default = "data/checkpoints/")
-    p.add_argument("--log_interval", type=int, default = 10)
-    p.add_argument("--save_ckpt_interval", type=int, default = 100)
-    p.add_argument("--eval_iters", type=int, default = 20)
-    p.add_argument("--eval_interval", type=int, default = 100)
+    p.add_argument("--log_interval", type=int, default = 100)
+    p.add_argument("--save_ckpt_interval", type=int, default = 1000)
+    p.add_argument("--eval_iters", type=int, default = 40)
+    p.add_argument("--eval_interval", type=int, default = 500)
     p.add_argument("--enable_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default = "cs336")
     p.add_argument("--wandb_run_name", type=str, default = "tiny_stories_test1")
@@ -116,7 +116,7 @@ class ModelConfig:
     d_ff: int = 1344
     rope_theta: float = 10000.0
     device: str = default_device()
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16
     eos_id: int | None = 0  # <|endoftext|> is id 0 in the TinyStories vocab
 
 @dataclass
@@ -205,12 +205,20 @@ def train():
     compiled_model = torch.compile(model)
 
     param_groups = split_decay_parameters(model.named_parameters())
-    optimizer = AdamW(
-        param_groups,
-        cfg.optim.lr_min,
-        cfg.optim.betas,
-        cfg.optim.weight_decay,
-    )
+    if True:
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr = cfg.optim.lr_min,
+            betas = cfg.optim.betas,
+            weight_decay = cfg.optim.weight_decay,
+        )
+    else:
+        optimizer = AdamW(
+            param_groups,
+            cfg.optim.lr_min,
+            cfg.optim.betas,
+            cfg.optim.weight_decay,
+        )
 
     start_iter = 0
     if cfg.args.resume:
@@ -275,8 +283,6 @@ def train():
     ckpt_path = os.path.join(cfg.args.ckpt_dir, f"ckpt_step_{cfg.data.max_iter}.pt")
     save_checkpoint(model, optimizer, cfg.data.max_iter, ckpt_path)
     print(f"Saved ckpt to {ckpt_path}")
-
-
 
 
 

@@ -187,7 +187,7 @@ class MultiHeadSelfAttention(nn.Module):
         if mask is None:
             mask = torch.tril(
                 torch.ones(seq_len, seq_len, device = x.device, dtype = torch.bool))
-        if True:
+        if False:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask = mask)
         else:
             out = scaled_dot_product_attention(q, k, v, mask)
