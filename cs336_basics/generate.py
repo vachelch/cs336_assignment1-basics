@@ -102,3 +102,4 @@ if __name__ == "__main__":
         prompt, tokenizer, model, 
         context_length = cfg.model.context_length, temperature = 0.7, top_p = 0.8
     )
+    print(output)
