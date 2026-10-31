@@ -76,17 +76,6 @@ def load_checkpoint(
     optimizer.load_state_dict(ckpt["optimizer"])
     return ckpt["iteration"]
 
-@torch.no_grad()
-def evaluate(model, eval_data, cfg):
-    total_loss = []
-    for _ in range(cfg.args.eval_iters):
-        inputs, targets = get_batch(eval_data, cfg.data.batch_size, cfg.model.context_length, cfg.model.device)
-        logits = model(inputs)
-        loss = cross_entropy(logits, targets)
-        total_loss.append(loss)
-    return (sum(total_loss) / len(total_loss)).item()
-
-
 def split_decay_parameters(name_params):
     no_decay = []
     decay = []
@@ -105,6 +94,28 @@ def default_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+def loss_fn(model, inputs, targets):
+    # compile forward + loss together so the fp32 upcast and CE get fused with the lm_head
+    logits = model(inputs)
+    if True:
+        return F.cross_entropy(
+            logits.float().view(-1, logits.shape[-1]),
+            targets.view(-1)
+        )
+    else:
+        return cross_entropy(logits, targets)
+
+compiled_loss_fn = torch.compile(loss_fn)
+
+@torch.no_grad()
+def evaluate(model, eval_data, cfg):
+    total_loss = []
+    for _ in range(cfg.args.eval_iters):
+        inputs, targets = get_batch(eval_data, cfg.data.batch_size, cfg.model.context_length, cfg.model.device)
+        total_loss.append(compiled_loss_fn(model, inputs, targets))
+    return (sum(total_loss) / len(total_loss)).item()
+
 
 @dataclass
 class ModelConfig:
@@ -203,18 +214,6 @@ def train():
         cfg.model.eos_id,
     )
 
-    # compile forward + loss together so the fp32 upcast and CE get fused with the lm_head
-    def loss_fn(inputs, targets):
-        logits = model(inputs)
-        if True:
-            return F.cross_entropy(
-                logits.float().view(-1, logits.shape[-1]),
-                targets.view(-1)
-            )
-        else:
-            return cross_entropy(logits, targets)
-    compiled_loss_fn = torch.compile(loss_fn)
-
     param_groups = split_decay_parameters(model.named_parameters())
     if False:
         optimizer = torch.optim.AdamW(
@@ -246,7 +245,7 @@ def train():
         )
         for group in optimizer.param_groups:
             group["lr"] = lr
-        loss = compiled_loss_fn(inputs, targets)
+        loss = compiled_loss_fn(model, inputs, targets)
 
         optimizer.zero_grad()
         loss.backward()

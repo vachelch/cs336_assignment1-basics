@@ -257,7 +257,7 @@ class TransformerLM(nn.Module):
         x: Int[Tensor, " ... seq_len"]
     ) -> Float[Tensor, " ... seq_len vocab_size"]:
         seq_len = x.shape[-1]
-        assert seq_len <= self.context_length
+        assert 0 < seq_len <= self.context_length
 
         # document aware attention
         mask = torch.tril(
